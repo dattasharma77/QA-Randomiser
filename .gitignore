@@ -1,0 +1,24 @@
+# Secrets — never commit these
+.streamlit/secrets.toml
+qa_frozen_picks.json
+qa_frozen_archive.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+venv/
+env/
+
+# VS Code
+.vscode/launch.json
+
+# OS
+.DS_Store
+Thumbs.db
