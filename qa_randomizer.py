@@ -359,20 +359,50 @@ def save_frozen(data: dict):
         json.dump(data, f, indent=2, default=str)
     # Auto-archive: persist a copy to the archive file (append-only, never cleared)
     save_to_archive(data)
+    # Also persist to Snowflake if connection is available
+    save_to_snowflake_archive(data)
 
 
 def load_archive() -> dict:
-    """Load the persistent archive of all frozen picks across all months."""
-    if not Path(ARCHIVE_FILE).exists():
-        return {"alerts": [], "zendesk": []}
-    try:
-        with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        d.setdefault("alerts", [])
-        d.setdefault("zendesk", [])
-        return d
-    except Exception:
-        return {"alerts": [], "zendesk": []}
+    """Load the persistent archive of all frozen picks across all months.
+    Merges local JSON + Snowflake table for maximum coverage."""
+    # Local JSON
+    local = {"alerts": [], "zendesk": []}
+    if Path(ARCHIVE_FILE).exists():
+        try:
+            with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
+                local = json.load(f)
+            local.setdefault("alerts", [])
+            local.setdefault("zendesk", [])
+        except Exception:
+            pass
+
+    # Snowflake archive (persistent across reboots)
+    sf_data = load_from_snowflake_archive()
+
+    # Merge: combine both, deduplicate
+    all_alerts = local.get("alerts", []) + sf_data.get("alerts", [])
+    all_zendesk = local.get("zendesk", []) + sf_data.get("zendesk", [])
+
+    # Deduplicate alerts by ALERT_ID + Month + Week
+    seen_a = set()
+    deduped_alerts = []
+    for r in all_alerts:
+        key = (str(r.get("ALERT_ID", "")), r.get("Month", ""), r.get("Week", ""))
+        if key not in seen_a:
+            deduped_alerts.append(r)
+            seen_a.add(key)
+
+    # Deduplicate zendesk by TICKET_ID + Month + Week
+    seen_z = set()
+    deduped_zendesk = []
+    for r in all_zendesk:
+        key = (str(r.get("TICKET_ID", "")), r.get("Month", ""), r.get("Week", ""))
+        if key not in seen_z:
+            deduped_zendesk.append(r)
+            seen_z.add(key)
+
+    return {"alerts": deduped_alerts, "zendesk": deduped_zendesk}
 
 
 def save_to_archive(current_data: dict):
@@ -405,6 +435,127 @@ def save_to_archive(current_data: dict):
 
     with open(ARCHIVE_FILE, "w", encoding="utf-8") as f:
         json.dump(archive, f, indent=2, default=str)
+
+
+def _get_snowflake_conn():
+    """Get a Snowflake connection using secrets. Returns None if not configured."""
+    try:
+        sf_secrets = st.secrets["snowflake"]
+        import snowflake.connector
+        conn_params = {
+            "account":   sf_secrets["account"],
+            "user":      sf_secrets["user"],
+            "warehouse": sf_secrets["warehouse"],
+            "role":      sf_secrets.get("role", ""),
+            "database":  "EDLDIGITALVIEWS",
+            "schema":    "EDLDIGITALVIEWSBI",
+        }
+        if "password" in sf_secrets and sf_secrets["password"]:
+            conn_params["password"] = sf_secrets["password"]
+        else:
+            conn_params["authenticator"] = sf_secrets.get("authenticator", "externalbrowser")
+        return snowflake.connector.connect(**conn_params)
+    except Exception:
+        return None
+
+
+def save_to_snowflake_archive(data: dict):
+    """Persist frozen picks to Snowflake archive table (deduplicates by checking existing)."""
+    try:
+        conn = _get_snowflake_conn()
+        if conn is None:
+            return
+        from snowflake_queries import (get_create_archive_table_sql,
+                                       get_insert_archive_sql, get_check_existing_sql)
+        cur = conn.cursor()
+        # Ensure table exists
+        cur.execute(get_create_archive_table_sql())
+
+        # Prepare records with record_type tag
+        all_records = []
+        for r in data.get("alerts", []):
+            rec = dict(r)
+            rec["record_type"] = "alerts"
+            all_records.append(rec)
+        for r in data.get("zendesk", []):
+            rec = dict(r)
+            rec["record_type"] = "zendesk"
+            all_records.append(rec)
+
+        if not all_records:
+            conn.close()
+            return
+
+        # Group by month+week+type and only insert if not already in table
+        from itertools import groupby
+        def group_key(r):
+            return (r.get("Month", ""), r.get("Week", ""), r.get("record_type", ""))
+
+        sorted_recs = sorted(all_records, key=group_key)
+        new_records = []
+        for key, group in groupby(sorted_recs, key=group_key):
+            month, week, rtype = key
+            if not month or not week:
+                continue
+            cur.execute(get_check_existing_sql(month, week, rtype))
+            row = cur.fetchone()
+            if row and row[0] > 0:
+                continue  # already archived this month/week/type
+            new_records.extend(list(group))
+
+        if new_records:
+            statements = get_insert_archive_sql(new_records)
+            for stmt in statements:
+                cur.execute(stmt)
+
+        conn.close()
+    except Exception:
+        pass  # Silently fail — local JSON is the fallback
+
+
+def load_from_snowflake_archive() -> dict:
+    """Load all archived picks from Snowflake. Returns dict like frozen_data."""
+    try:
+        conn = _get_snowflake_conn()
+        if conn is None:
+            return {"alerts": [], "zendesk": []}
+        from snowflake_queries import get_create_archive_table_sql, get_load_archive_sql
+        cur = conn.cursor()
+        cur.execute(get_create_archive_table_sql())  # ensure exists
+        cur.execute(get_load_archive_sql())
+        cols = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()
+        conn.close()
+
+        alerts = []
+        zendesk = []
+        for row in rows:
+            rec = dict(zip(cols, row))
+            # Reconstruct into the format the dashboard expects
+            pick = {
+                "Month": rec.get("MONTH", ""),
+                "Week": rec.get("WEEK", ""),
+                "AgentName": rec.get("AGENT_NAME", ""),
+                "TL": rec.get("TL", ""),
+                "QA_BRACKET": rec.get("QA_BRACKET", ""),
+                "SampleCategory": rec.get("SAMPLE_CATEGORY", ""),
+                "UPDATE_DATE": rec.get("UPDATE_DATE", ""),
+                "FrozenAt": rec.get("FROZEN_AT", ""),
+                "LOGIN_NAME_TXT": rec.get("LOGIN_NAME_TXT", ""),
+            }
+            if rec.get("RECORD_TYPE") == "alerts":
+                pick["ALERT_ID"] = rec.get("ITEM_ID", "")
+                pick["ALERT_TYPE_DESC"] = rec.get("ALERT_TYPE_DESC", "")
+                pick["SRC_RESOLVED_BY_AGENT_ID"] = rec.get("AGENT_ID", "")
+                alerts.append(pick)
+            else:
+                pick["TICKET_ID"] = rec.get("ITEM_ID", "")
+                pick["AGENT_NAME"] = rec.get("AGENT_ID", "")
+                zendesk.append(pick)
+
+        return {"alerts": alerts, "zendesk": zendesk}
+    except Exception:
+        return {"alerts": [], "zendesk": []}
 
 # --- Date helpers ---
 

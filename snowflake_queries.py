@@ -376,3 +376,93 @@ AND COLLATE(teams, 'en-ci') LIKE '%Risk%'
 GROUP BY 1,2,3,4,5,6,7
 ORDER BY 1
 """
+
+
+# --- Archive table queries for persistent frozen picks storage ---
+
+ARCHIVE_TABLE = "QA_FROZEN_ARCHIVE"
+ARCHIVE_SCHEMA = "EDLDIGITALVIEWSBI"
+ARCHIVE_DB = "EDLDIGITALVIEWS"
+ARCHIVE_FULL = f"{ARCHIVE_DB}.{ARCHIVE_SCHEMA}.{ARCHIVE_TABLE}"
+
+
+def get_create_archive_table_sql():
+    """SQL to create the archive table if it doesn't exist."""
+    return f"""
+CREATE TABLE IF NOT EXISTS {ARCHIVE_FULL} (
+    RECORD_TYPE       VARCHAR(10),    -- 'alerts' or 'zendesk'
+    MONTH             VARCHAR(7),     -- 'YYYY-MM'
+    WEEK              VARCHAR(10),    -- 'Week 1', 'Week 2', etc.
+    AGENT_ID          VARCHAR(200),   -- SRC_RESOLVED_BY_AGENT_ID or AGENT_NAME
+    AGENT_NAME        VARCHAR(200),
+    TL                VARCHAR(200),
+    QA_BRACKET        NUMBER,
+    ITEM_ID           VARCHAR(50),    -- ALERT_ID or TICKET_ID
+    ALERT_TYPE_DESC   VARCHAR(100),
+    SAMPLE_CATEGORY   VARCHAR(20),    -- Alerts, BV, Redeems, Zendesk
+    UPDATE_DATE       VARCHAR(30),
+    FROZEN_AT         VARCHAR(30),
+    LOGIN_NAME_TXT    VARCHAR(200),
+    EXTRA_JSON        VARCHAR(5000),  -- any other fields as JSON
+    INSERTED_AT       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+)
+"""
+
+
+def get_insert_archive_sql(records: list) -> str:
+    """Build INSERT statement for archive records."""
+    if not records:
+        return ""
+
+    def esc(val):
+        if val is None:
+            return "NULL"
+        s = str(val).replace("'", "''")
+        return f"'{s}'"
+
+    rows = []
+    for r in records:
+        row = (
+            esc(r.get("record_type", "")),
+            esc(r.get("Month", "")),
+            esc(r.get("Week", "")),
+            esc(r.get("SRC_RESOLVED_BY_AGENT_ID", r.get("AGENT_NAME", ""))),
+            esc(r.get("AgentName", "")),
+            esc(r.get("TL", "")),
+            str(r.get("QA_BRACKET", "NULL")),
+            esc(r.get("ALERT_ID", r.get("TICKET_ID", ""))),
+            esc(r.get("ALERT_TYPE_DESC", "")),
+            esc(r.get("SampleCategory", "")),
+            esc(r.get("UPDATE_DATE", "")),
+            esc(r.get("FrozenAt", "")),
+            esc(r.get("LOGIN_NAME_TXT", "")),
+            esc(""),  # EXTRA_JSON placeholder
+        )
+        rows.append(f"({','.join(row)})")
+
+    # Snowflake supports multi-row INSERT up to ~16MB
+    # Batch in chunks of 500
+    statements = []
+    for i in range(0, len(rows), 500):
+        batch = rows[i:i+500]
+        stmt = f"""INSERT INTO {ARCHIVE_FULL}
+(RECORD_TYPE, MONTH, WEEK, AGENT_ID, AGENT_NAME, TL, QA_BRACKET,
+ ITEM_ID, ALERT_TYPE_DESC, SAMPLE_CATEGORY, UPDATE_DATE, FROZEN_AT,
+ LOGIN_NAME_TXT, EXTRA_JSON)
+VALUES {','.join(batch)}"""
+        statements.append(stmt)
+    return statements
+
+
+def get_load_archive_sql(month: str = None) -> str:
+    """SQL to load archive records, optionally filtered by month."""
+    where = f"WHERE MONTH = '{month}'" if month else ""
+    return f"SELECT * FROM {ARCHIVE_FULL} {where} ORDER BY MONTH DESC, WEEK, AGENT_NAME"
+
+
+def get_check_existing_sql(month: str, week: str, record_type: str) -> str:
+    """Check if records already exist for a given month/week/type."""
+    return f"""
+SELECT COUNT(*) AS cnt FROM {ARCHIVE_FULL}
+WHERE MONTH = '{month}' AND WEEK = '{week}' AND RECORD_TYPE = '{record_type}'
+"""
