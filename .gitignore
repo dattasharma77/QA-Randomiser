@@ -1,7 +1,5 @@
 # Secrets — never commit these
 .streamlit/secrets.toml
-qa_frozen_picks.json
-qa_frozen_archive.json
 
 # Python
 __pycache__/

@@ -18,11 +18,22 @@ from pathlib import Path
 FROZEN_FILE = "qa_frozen_picks.json"
 ARCHIVE_FILE = "qa_frozen_archive.json"
 
-# On Streamlit Cloud, use /tmp for writable storage
+# On Streamlit Cloud, use the mounted repo path for reading, /tmp for writing
 import os, tempfile
-if not os.access(".", os.W_OK):
+_ON_CLOUD = not os.access(".", os.W_OK)
+if _ON_CLOUD:
+    # Cloud: write to /tmp, but also check repo mount for initial data
     FROZEN_FILE = os.path.join(tempfile.gettempdir(), "qa_frozen_picks.json")
     ARCHIVE_FILE = os.path.join(tempfile.gettempdir(), "qa_frozen_archive.json")
+    # Copy repo-committed JSON to /tmp on first boot (if exists in repo)
+    _REPO_FROZEN = "/mount/src/qa-randomiser/qa_frozen_picks.json"
+    _REPO_ARCHIVE = "/mount/src/qa-randomiser/qa_frozen_archive.json"
+    if os.path.exists(_REPO_FROZEN) and not os.path.exists(FROZEN_FILE):
+        import shutil
+        shutil.copy2(_REPO_FROZEN, FROZEN_FILE)
+    if os.path.exists(_REPO_ARCHIVE) and not os.path.exists(ARCHIVE_FILE):
+        import shutil
+        shutil.copy2(_REPO_ARCHIVE, ARCHIVE_FILE)
 NAVY = "#1a2744"
 
 BRACKET_TARGETS = {
@@ -460,7 +471,8 @@ def _get_snowflake_conn():
 
 
 def save_to_snowflake_archive(data: dict):
-    """Persist frozen picks to Snowflake archive table (deduplicates by checking existing)."""
+    """Persist frozen picks to Snowflake archive table (deduplicates by checking existing).
+    Silently skips if no write permissions."""
     try:
         conn = _get_snowflake_conn()
         if conn is None:
