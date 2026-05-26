@@ -48,6 +48,36 @@ HEAVY_WEEKS = {2, 4}
 # German team identifier — Zendesk excluded, de_idnow_fraud excluded from alerts
 GERMAN_TEAM = "GERMAN"
 
+# German agents — hardcoded list. These agents:
+#   • Do NOT receive Zendesk samples
+#   • de_idnow_fraud is excluded from their Alerts pool
+# Match is done case-insensitive against the agent's USER_ID (e.g. "Ramadasu.Kumar")
+GERMAN_AGENT_IDS = {
+    "ramadasu.kumar",
+    "aravind.meka",
+    "vineeth.nadikatla",
+    "rubina.tabassum",
+    "sakshi.mishra",
+    "gurrala.kiran",
+    "asma.fathima",
+    "s.mohammed2",
+    "ravikiran.vissa",
+    "rajesh.akula",
+    "h.gattikoppula",
+    "kishmathi.arjun",
+    "vejerla.likhitha",
+    "turerao.kumar",
+    "chsrividya.tapaswi",
+}
+
+
+def is_german_agent_id(agent_id) -> bool:
+    """True if the given agent USER_ID is in the hardcoded German agents list."""
+    if agent_id is None:
+        return False
+    return str(agent_id).strip().lower() in GERMAN_AGENT_IDS
+
+
 # Zendesk: only keep tickets from these groups (Risk emails / Risk documents)
 ZENDESK_ALLOWED_GROUPS = {
     "risk", "risk email", "risk emails", "risk document", "risk documents",
@@ -204,7 +234,7 @@ def transform_alerts(df: pd.DataFrame, bracket_df: pd.DataFrame | None = None) -
     """
     Apply transformations to raw alerts CSV:
     1. Exclude manual_docupload
-    2. Exclude de_idnow_fraud for German agents
+    2. Exclude de_idnow_fraud for German agents (hardcoded GERMAN_AGENT_IDS list)
     3. Assign Category (BV override, Document->Alerts, Redeems)
     4. Keep all rows (both Proactive and Passive)
     Returns cleaned DataFrame with CATEGORY column added.
@@ -214,16 +244,10 @@ def transform_alerts(df: pd.DataFrame, bracket_df: pd.DataFrame | None = None) -
     if "ALERT_TYPE_DESC" in df.columns:
         df = df[df["ALERT_TYPE_DESC"].str.strip().str.lower() != "manual_docupload"]
 
-    # Exclude de_idnow_fraud for German agents (TL = Williams Nikita Grace Gary)
-    if bracket_df is not None and "SRC_RESOLVED_BY_AGENT_ID" in df.columns:
-        # Build user_id -> TL lookup
-        uid_to_tl = dict(zip(bracket_df["USER_ID"].str.strip().str.lower(),
-                             bracket_df["TL"].str.strip().str.lower()))
-        german_uids = set(
-            uid for uid, tl in uid_to_tl.items()
-            if tl == "williams nikita grace gary"
-        )
-        german_mask = df["SRC_RESOLVED_BY_AGENT_ID"].str.strip().str.lower().isin(german_uids)
+    # Exclude de_idnow_fraud for German agents (hardcoded list — see GERMAN_AGENT_IDS)
+    # bracket_df is no longer required for this filter, but kept for signature compatibility.
+    if "SRC_RESOLVED_BY_AGENT_ID" in df.columns and "ALERT_TYPE_DESC" in df.columns:
+        german_mask = df["SRC_RESOLVED_BY_AGENT_ID"].apply(is_german_agent_id)
         de_fraud_mask = df["ALERT_TYPE_DESC"].str.strip().str.lower() == "de_idnow_fraud"
         df = df[~(german_mask & de_fraud_mask)]
 
@@ -372,11 +396,15 @@ def save_frozen(data: dict):
     save_to_archive(data)
     # Also persist to Snowflake if connection is available
     save_to_snowflake_archive(data)
+    # Clear caches so dashboard picks up new data
+    load_archive.clear()
+    load_from_snowflake_archive.clear()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def load_archive() -> dict:
     """Load the persistent archive of all frozen picks across all months.
-    Merges local JSON + Snowflake table for maximum coverage."""
+    Merges local JSON + Snowflake table for maximum coverage. Cached for 60s."""
     # Local JSON
     local = {"alerts": [], "zendesk": []}
     if Path(ARCHIVE_FILE).exists():
@@ -525,8 +553,9 @@ def save_to_snowflake_archive(data: dict):
         pass  # Silently fail — local JSON is the fallback
 
 
+@st.cache_data(ttl=300, show_spinner="Loading archive from Snowflake...")
 def load_from_snowflake_archive() -> dict:
-    """Load all archived picks from Snowflake. Returns dict like frozen_data."""
+    """Load all archived picks from Snowflake. Returns dict like frozen_data. Cached for 5 min."""
     try:
         conn = _get_snowflake_conn()
         if conn is None:
@@ -745,45 +774,49 @@ def sample_tab(df: pd.DataFrame, tab: str, month_str: str, week_num: int,
     tl_lookup      = dict(zip(bracket_df[lookup_col].str.lower(), bracket_df["TL"]))
     name_lookup    = dict(zip(bracket_df[lookup_col].str.lower(), bracket_df["NAME"]))
 
-    # ── For Zendesk tab: build fuzzy lookup to handle reversed names ──────────
-    # e.g. bracketing has "Pedishetty Lavanya" but Snowflake has "Lavanya Pedishetty"
-    if tab == "zendesk":
-        # Get all unique agent names from the data
-        data_agents = set(df[agent_col].astype(str).str.strip().str.lower().unique())
-        # For each bracketing ZENDESK_ID that doesn't exactly match, try fuzzy
-        fuzzy_map = {}  # data_agent_key -> bracket_key
-        unmatched_data = data_agents - set(bracket_lookup.keys())
-        unmatched_bracket = {
-            k for k in bracket_lookup.keys()
-            if k not in data_agents and k and str(k).lower() != 'nan'
-        }
+    # ── Fuzzy lookup to handle name/ID variants in BOTH tabs ─────────────────
+    # Zendesk: bracketing has "Pedishetty Lavanya" but Snowflake has "Lavanya Pedishetty"
+    # Alerts:  bracketing has "ramji.kumar" but Snowflake has "Ramji Kumar" / "ramji_kumar" / etc.
+    # Tokens are split on whitespace AND dots/underscores so "ramji.kumar" -> {ramji, kumar}.
+    import re as _re
+    def _tokens(val: str) -> set:
+        s = str(val).strip().lower()
+        return {t for t in _re.split(r"[\s._]+", s) if t}
 
-        for data_name in unmatched_data:
-            data_tokens = set(str(data_name).split())
-            best_key = None
-            best_score = 0
-            for bk in unmatched_bracket:
-                try:
-                    bk_tokens = set(str(bk).split())
-                except Exception:
-                    continue
-                if not data_tokens or not bk_tokens:
-                    continue
-                score = len(data_tokens & bk_tokens) / len(data_tokens | bk_tokens)
-                if len(data_tokens) == 2 and data_tokens == bk_tokens:
-                    score = 1.0
-                if score > best_score and score >= 0.5:
-                    best_score = score
-                    best_key = bk
-            if best_key:
-                fuzzy_map[data_name] = best_key
+    data_agents = set(df[agent_col].astype(str).str.strip().str.lower().unique())
+    fuzzy_map = {}  # data_agent_key -> bracket_key
+    unmatched_data = data_agents - set(bracket_lookup.keys())
+    unmatched_bracket = {
+        k for k in bracket_lookup.keys()
+        if k not in data_agents and k and str(k).lower() != 'nan'
+    }
 
-        # Extend lookups with fuzzy matches
-        for data_key, bracket_key in fuzzy_map.items():
-            if data_key not in bracket_lookup:
-                bracket_lookup[data_key] = bracket_lookup[bracket_key]
-                tl_lookup[data_key]      = tl_lookup.get(bracket_key, "Unknown")
-                name_lookup[data_key]    = name_lookup.get(bracket_key, data_key)
+    for data_name in unmatched_data:
+        data_tok = _tokens(data_name)
+        if not data_tok:
+            continue
+        best_key = None
+        best_score = 0.0
+        for bk in unmatched_bracket:
+            bk_tok = _tokens(bk)
+            if not bk_tok:
+                continue
+            score = len(data_tok & bk_tok) / len(data_tok | bk_tok)
+            # Two-token exact match (any order) -> perfect
+            if len(data_tok) == 2 and data_tok == bk_tok:
+                score = 1.0
+            if score > best_score and score >= 0.5:
+                best_score = score
+                best_key = bk
+        if best_key:
+            fuzzy_map[data_name] = best_key
+
+    # Extend lookups with fuzzy matches (don't override exact matches)
+    for data_key, bracket_key in fuzzy_map.items():
+        if data_key not in bracket_lookup:
+            bracket_lookup[data_key] = bracket_lookup[bracket_key]
+            tl_lookup[data_key]      = tl_lookup.get(bracket_key, "Unknown")
+            name_lookup[data_key]    = name_lookup.get(bracket_key, data_key)
 
     # Also build a user_id -> zendesk_id map for cross-tab lookup
     uid_to_zid = dict(zip(bracket_df["USER_ID"].str.lower(), bracket_df["ZENDESK_ID"].str.lower()))
@@ -870,15 +903,22 @@ def sample_tab(df: pd.DataFrame, tab: str, month_str: str, week_num: int,
                 if not extra.empty:
                     picked_alerts = pd.concat([picked_alerts, extra], ignore_index=True)
 
-            # ── Week 4: compensate Zendesk shortfall with Alerts ──────────────
-            if week_num == 4:
+            # ── Week 3 & 4: compensate Zendesk shortfall with Alerts ─────────
+            if week_num >= 3:
                 zid_key = uid_to_zid.get(agent_key, agent_key)
                 zd_frozen = get_zendesk_frozen_count(zid_key, month_str, frozen_data)
-                zd_shortfall = max(0, targets["Zendesk"] - zd_frozen)
+                zd_monthly = targets["Zendesk"]
+                zd_cumulative = sum(weekly_quota(zd_monthly, w) for w in range(1, week_num + 1))
+                zd_shortfall = max(0, zd_cumulative - zd_frozen)
                 if zd_shortfall > 0:
-                    already_picked = set(picked_alerts[id_col].astype(str)) if not picked_alerts.empty else set()
-                    extra_pool = alert_pool[~alert_pool[id_col].astype(str).isin(already_picked | frozen_ids)].copy()
-                    extra = pick_rows(extra_pool, zd_shortfall, "Alerts")
+                    # Collect all IDs already picked across all categories
+                    already_picked = set()
+                    for _p in [picked_alerts, picked_bv, picked_redeems]:
+                        if not _p.empty:
+                            already_picked.update(_p[id_col].astype(str))
+                    # Use the full agent pool (all categories) for compensation
+                    full_pool = agent_df[~agent_df[id_col].astype(str).isin(already_picked | frozen_ids)].copy()
+                    extra = pick_rows(full_pool, zd_shortfall, "Alerts")
                     if not extra.empty:
                         picked_alerts = pd.concat([picked_alerts, extra], ignore_index=True)
 
@@ -906,11 +946,8 @@ def sample_tab(df: pd.DataFrame, tab: str, month_str: str, week_num: int,
 
         else:
             # Zendesk — weekly quota, no cross-tab compensation
-            # Skip entirely for German agents (TL = Williams Nikita Grace Gary)
-            agent_tl = str(tl_lookup.get(agent_key, "") or "").strip().lower()
-            is_german = agent_tl == "williams nikita grace gary"
-
-            if is_german:
+            # Skip entirely for German agents (hardcoded GERMAN_AGENT_IDS list)
+            if is_german_agent_id(agent_key):
                 continue  # skip Zendesk for German agents
 
             # SQL already filters to Risk groups — no extra group filter needed
@@ -1018,7 +1055,31 @@ def render_dashboard(frozen_data: dict, bracket_df: pd.DataFrame | None, month_s
                                       if "AgentName" in zendesk_df.columns
                                       else zendesk_df.get(agent_col_z, pd.Series()).astype(str).str.lower().map(zid_to_name).fillna(""))
 
-    # ── Filter options ────────────────────────────────────────────────────────
+    # ── Override QA_BRACKET with current bracket from bracketing file ─────────
+    # When an agent's bracket changes mid-month, picks made under the old bracket
+    # still appear when filtering by their current bracket. The original value
+    # stays in the JSON for audit; only the display column is updated.
+    if bracket_df is not None:
+        uid_to_bracket = dict(zip(
+            bracket_df["USER_ID"].str.strip().str.lower(),
+            bracket_df["QA_BRACKET"]
+        ))
+        zid_to_bracket = dict(zip(
+            bracket_df["ZENDESK_ID"].str.strip().str.lower(),
+            bracket_df["QA_BRACKET"]
+        ))
+        if not alerts_df.empty and agent_col_a in alerts_df.columns:
+            curr = alerts_df[agent_col_a].astype(str).str.strip().str.lower().map(uid_to_bracket)
+            if "QA_BRACKET" in alerts_df.columns:
+                alerts_df["QA_BRACKET"] = curr.fillna(alerts_df["QA_BRACKET"])
+            else:
+                alerts_df["QA_BRACKET"] = curr
+        if not zendesk_df.empty and agent_col_z in zendesk_df.columns:
+            curr = zendesk_df[agent_col_z].astype(str).str.strip().str.lower().map(zid_to_bracket)
+            if "QA_BRACKET" in zendesk_df.columns:
+                zendesk_df["QA_BRACKET"] = curr.fillna(zendesk_df["QA_BRACKET"])
+            else:
+                zendesk_df["QA_BRACKET"] = curr
     all_tls = sorted(set(
         list(alerts_df["TL"].dropna().unique()  if "TL" in alerts_df.columns  else []) +
         list(zendesk_df["TL"].dropna().unique() if "TL" in zendesk_df.columns else [])
@@ -1556,8 +1617,13 @@ with st.sidebar:
                 for wk in range(1, current_week + 1):
                     # Check if already frozen
                     ex_a = pd.DataFrame(frozen.get("alerts", []))
-                    already_a = (not ex_a.empty and "Month" in ex_a.columns and "Week" in ex_a.columns
-                                 and ((ex_a["Month"] == month_str) & (ex_a["Week"] == f"Week {wk}")).any())
+                    # For past weeks (< current_week), skip if already frozen
+                    # For current week, always re-sample to pick up compensation picks
+                    if wk < current_week:
+                        already_a = (not ex_a.empty and "Month" in ex_a.columns and "Week" in ex_a.columns
+                                     and ((ex_a["Month"] == month_str) & (ex_a["Week"] == f"Week {wk}")).any())
+                    else:
+                        already_a = False  # Always re-sample current week
 
                     if not already_a:
                         wk_start = 1 + (wk-1)*7
@@ -1571,9 +1637,15 @@ with st.sidebar:
                             wk_df["_day"] = wk_df["UPDATE_DATE"].apply(
                                 lambda v: parse_date(v).day if parse_date(v) else None
                             )
-                        wk_df = wk_df[
-                            (wk_df["_day"] >= wk_start) & (wk_df["_day"] <= wk_end)
-                        ].drop(columns=["_day"])
+
+                        # For current week: use full month data so compensation has a bigger pool
+                        # For past weeks: restrict to that week's date range
+                        if wk == current_week:
+                            wk_df = wk_df[wk_df["_day"] <= wk_end].drop(columns=["_day"])
+                        else:
+                            wk_df = wk_df[
+                                (wk_df["_day"] >= wk_start) & (wk_df["_day"] <= wk_end)
+                            ].drop(columns=["_day"])
 
                         debug_msgs.append(f"Week {wk} alerts: {len(wk_df)} rows in date range (days {wk_start}-{wk_end})")
 
